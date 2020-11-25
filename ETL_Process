@@ -1,0 +1,145 @@
+
+from sqlalchemy import engine,Table, select, insert, bindparam, create_engine, MetaData
+import requests
+from datetime import datetime
+import pytz
+from pytz import timezone
+
+#Set up and execute API call
+header = {'Authorization':'Bearer xxxx'}
+param={'tweet_mode':'extended','count':100}
+response = requests.get('https://api.twitter.com/1.1/search/tweets.json?q=qanon&lang=en', headers = header,params=param)
+print('API call successful')
+
+#All tweet related information
+all_status = [(i,j) for i,j in  enumerate(response.json()['statuses'])]
+text_list = [j['retweeted_status']['full_text'] if 'retweeted_status' in j else j['full_text'] for i,j in all_status ]
+tweet_id_list = [i['id'] for i in response.json()['statuses']]
+user_name_list=[i['user']['name'] for i in response.json()['statuses']]
+tweet_datetime_str=[i['created_at'] for i in response.json()['statuses']]
+tweet_date_list=[pytz.utc.localize(datetime.strptime(tweet_datetime_str[i],'%a %b %d %H:%M:%S +%f %Y')).astimezone(timezone('US/Central')).date() for i,j in enumerate(tweet_datetime_str)]
+retweet_count_list=[i['retweet_count'] for i in response.json()['statuses']]
+favorited_list=[i['favorite_count'] for i in response.json()['statuses']]
+#User Related Information
+#screen_name is @ handle
+handle_list=[i['user']['screen_name'] for i in response.json()['statuses']]
+name_list=[i['user']['name'] for i in response.json()['statuses']]
+user_description_list=[i['user']['description'] for i in response.json()['statuses']]
+followers_count_list=[i['user']['followers_count'] for i in response.json()['statuses']]
+user_location_list=[i['user']['location'] for i in response.json()['statuses']]
+verified_flag_list=[i['user']['verified'] for i in response.json()['statuses']]
+
+#Create tuples of new user values
+zipped_user_list = list(zip(handle_list,user_name_list,user_description_list,followers_count_list,user_location_list,verified_flag_list))
+#applying set, to make the elements of the list unique, in case the same user shows up twice in one API call.
+zipped_user_list = list(set(zipped_user_list))
+new_users=[]
+for i,j in enumerate(zipped_user_list):
+    u=dict(b_HANDLE=j[0],b_NAME=j[1],b_BIO=j[2],b_FOLLOWER_COUNT=j[3],b_LOCATION=j[4],b_VERIFIED_FLAG=j[5])
+    new_users.append(u)
+#Creating stage dictionary
+zipped_tweet_list = list(zip(tweet_id_list,user_name_list,tweet_date_list,text_list,retweet_count_list,favorited_list))
+zipped_tweet_list
+new_tweets=[]
+for i,j in enumerate(zipped_tweet_list):
+    q_stg_dict=dict(b_ID=j[0],b_NAME=j[1],b_DATE=j[2],b_TEXT=j[3],b_FAVORITED=j[5],b_RETWEET_COUNT=j[4])
+    new_tweets.append(q_stg_dict)
+	
+	
+	
+#SQLAlchemy configuration
+#Create engine
+engine=create_engine(r'mysql+pymysql://root:xxxx@localhost:3306/twitter')
+connection=engine.connect()
+#Create metadata bound to object
+metadata=MetaData(bind=engine)
+#Reflect tables. Write table information to metadata
+USER=Table('USER', metadata, autoload=True, autoload_with=connection)
+QANON_TWEETS_STG=Table('QANON_TWEETS_STG', metadata, autoload=True, autoload_with=connection)
+QANON_TWEETS_FACT=Table('QANON_TWEETS_FACT', metadata, autoload=True, autoload_with=connection)
+print('Configuration of connection set')
+
+#Wipe the staging table
+connection.execute('TRUNCATE table QANON_TWEETS_STG')
+print('Staging table truncated')
+
+#Add new users to ins_list and current users to upd_list
+ins_list = []
+upd_list = []
+#If user is not in table add to ins_list, else add user to upd_list
+for i,j in enumerate(new_users):
+    select_check = select([USER]).where(USER.columns.HANDLE==new_users[i]['b_HANDLE'])
+    if connection.execute(select_check).scalar()==None:
+        ins_list.append(j)
+    elif connection.execute(select_check).scalar()!=None:
+        upd_list.append(j)
+#Insert values from ins_list
+#Checking if len of lists are larger than zero. Inserting or updating an empty list causes an error
+if len(ins_list)>0:
+    ins=USER.insert().values({'HANDLE':bindparam('b_HANDLE'),
+                              'NAME':bindparam('b_NAME'),
+                              'BIO':bindparam('b_BIO'),
+                              'FOLLOWER_COUNT':bindparam('b_FOLLOWER_COUNT'),
+                              'LOCATION':bindparam('b_LOCATION'),
+                              'VERIFIED_FLAG':bindparam('b_VERIFIED_FLAG')})
+    connection.execute(ins,ins_list)
+#Update values from upd_list
+if len(upd_list)>0:
+    upd=USER.update().where(USER.columns.HANDLE==bindparam('b_HANDLE')).values({'NAME':bindparam('b_NAME'),
+                                                                                'BIO':bindparam('b_BIO'),
+                                                                                 'FOLLOWER_COUNT':bindparam('b_FOLLOWER_COUNT'),
+                                                                                 'LOCATION':bindparam('b_LOCATION'),
+                                                                                 'VERIFIED_FLAG':bindparam('b_VERIFIED_FLAG')})
+    connection.execute(upd,upd_list)
+
+#Insert stg records
+ins=QANON_TWEETS_STG.insert().values({'ID':bindparam('b_ID'),
+                              'USER_NAME':bindparam('b_NAME'),
+                              'DATE':bindparam('b_DATE'),
+                              'TEXT':bindparam('b_TEXT'),
+                              'FAVORITED':bindparam('b_FAVORITED'),
+                              'RETWEET_COUNT':bindparam('b_RETWEET_COUNT')})
+if len(new_tweets)>0:
+    connection.execute(ins,new_tweets)
+print('Insert into user and staging sucessful')
+
+#Have to do a join between user table and staging to retrieve user_no. This result of this join will be inserted into the fact table.	
+#Bringing in the foreign key (the user surrogate key)
+join_for_fk=QANON_TWEETS_STG.join(USER, QANON_TWEETS_STG.columns.USER_NAME==USER.columns.NAME)
+#how does this 'select_from' method work?
+stmt=select([QANON_TWEETS_STG.columns.ID,
+             QANON_TWEETS_STG.columns.DATE,
+             QANON_TWEETS_STG.columns.TEXT,
+             QANON_TWEETS_STG.columns.FAVORITED,
+             QANON_TWEETS_STG.columns.RETWEET_COUNT,
+             USER.columns.USER_NO]).select_from(join_for_fk)
+#This will be used for fact_table writing.
+joined_stage=connection.execute(stmt).fetchall()
+
+#Create the fact dictionary, just like you did for the stage. The input is the result of joined query.
+new_tweets_fact=[]
+for i,j in enumerate(joined_stage):
+    q_fact_dict=dict(b_ID=j[0],b_DATE=j[1],b_TEXT=j[2],b_FAVORITED=j[3],b_RETWEET_COUNT=j[4],b_USER_NO=j[5])
+    new_tweets_fact.append(q_fact_dict)
+
+#Add new tweets to fact_ins_list
+fact_ins_list=[]
+for i,j in enumerate(new_tweets_fact):
+    select_check = select([USER]).where(QANON_TWEETS_FACT.columns.ID==new_tweets_fact[i]['b_ID'])
+    #Checking that the record is not in the fact already with the first condition. 
+    #Not inserting duplicates records from fact_ins_list with second condition
+    if connection.execute(select_check).scalar()==None and j not in fact_ins_list:
+        fact_ins_list.append(j)
+
+
+#Insert into the fact table 		
+ins=QANON_TWEETS_FACT.insert().values({'ID':bindparam('b_ID'),
+                              'DATE':bindparam('b_DATE'),
+                              'TEXT':bindparam('b_TEXT'),
+                              'FAVORITED':bindparam('b_FAVORITED'),
+                              'RETWEET_COUNT':bindparam('b_RETWEET_COUNT'),
+                              'USER_NO':bindparam('b_USER_NO')})
+
+if len(fact_ins_list)>0:
+    connection.execute(ins,fact_ins_list)
+print('Insert into fact successful')	
